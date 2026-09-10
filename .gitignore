@@ -1,0 +1,19 @@
+# Generated inventory data
+workspace_user_access.csv
+workspace_user_locations.csv
+workspace_inspection_errors.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local configuration
+.env
+.env.*
+
+# Editors and operating system
+.idea/
+.DS_Store
+Thumbs.db
