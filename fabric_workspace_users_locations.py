@@ -1,8 +1,9 @@
-"""Inventory Fabric workspace users and enrich them with Entra location data.
+"""Inventory tenant Fabric workspace users and enrich them with Entra data.
 
 Authentication uses the interactive Azure CLI user session. This script does
 not require a custom app registration, client ID, client secret, or service
-principal.
+principal. Tenant-wide mode requires the signed-in user to be a Fabric
+administrator.
 
 Examples:
     az login --tenant <tenant-id>
@@ -29,6 +30,7 @@ import requests
 
 FABRIC_API_ROOT = "https://api.fabric.microsoft.com/v1"
 GRAPH_API_ROOT = "https://graph.microsoft.com/v1.0"
+POWER_BI_API_ROOT = "https://api.powerbi.com/v1.0/myorg"
 
 USER_FIELDS = [
     "id",
@@ -48,10 +50,20 @@ USER_FIELDS = [
     "department",
     "jobTitle",
 ]
+WORKSPACE_FIELDS = [
+    "workspaceId",
+    "workspaceName",
+    "workspaceType",
+    "workspaceState",
+    "capacityId",
+    "isOnDedicatedCapacity",
+    "description",
+]
 ACCESS_FIELDS = [
     "workspaceId",
     "workspaceName",
     "workspaceType",
+    "workspaceState",
     "capacityId",
     "capacityRegion",
     "role",
@@ -126,13 +138,34 @@ class AzureCliTokenProvider:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "List effective users of accessible Fabric workspaces and enrich "
+            "List effective users of all tenant Fabric workspaces and enrich "
             "them with Microsoft Graph location attributes."
         )
     )
     parser.add_argument(
         "--tenant-id",
         help="Tenant GUID or domain. Used only if an interactive az login is required.",
+    )
+    parser.add_argument(
+        "--accessible-only",
+        action="store_true",
+        help=(
+            "Use user-scoped Fabric APIs instead of tenant admin APIs. This "
+            "returns only workspaces accessible to the signed-in user."
+        ),
+    )
+    parser.add_argument(
+        "--include-inactive-workspaces",
+        action="store_true",
+        help="Include deleted and removing workspaces in tenant-wide mode.",
+    )
+    parser.add_argument(
+        "--admin-page-size",
+        type=int,
+        default=1000,
+        choices=range(1, 5001),
+        metavar="1-5000",
+        help="Tenant admin workspace page size. Default: 1000",
     )
     parser.add_argument(
         "--exclude-entire-tenant",
@@ -299,6 +332,108 @@ def get_all_pages(
     return rows
 
 
+def get_tenant_workspaces_with_users(
+    token_provider: AzureCliTokenProvider,
+    *,
+    include_inactive: bool,
+    page_size: int,
+    request_timeout: int,
+    max_retries: int,
+) -> list[dict[str, Any]]:
+    workspaces: list[dict[str, Any]] = []
+    skip = 0
+
+    while True:
+        params = [f"$top={page_size}", f"$skip={skip}", "$expand=users"]
+        if not include_inactive:
+            params.append("$filter=state%20eq%20%27Active%27")
+        url = f"{POWER_BI_API_ROOT}/admin/groups?{'&'.join(params)}"
+        page = request_json(
+            "GET",
+            url,
+            token_provider,
+            request_timeout=request_timeout,
+            max_retries=max_retries,
+        )
+        page_workspaces = page.get("value", [])
+        workspaces.extend(page_workspaces)
+        if len(page_workspaces) < page_size:
+            return workspaces
+        skip += page_size
+
+
+def normalize_admin_workspace_assignment(
+    workspace: dict[str, Any],
+    principal: dict[str, Any],
+    tenant_id: str | None,
+) -> dict[str, Any] | None:
+    principal_type = principal.get("principalType")
+    workspace_role = principal.get("groupUserAccessRight")
+    principal_id = (
+        principal.get("graphId")
+        or principal.get("identifier")
+        or principal.get("emailAddress")
+    )
+
+    if not workspace_role or workspace_role == "None":
+        return None
+
+    if (
+        principal_type == "None"
+        or tenant_id
+        and principal_id
+        and str(principal_id).lower() == tenant_id.lower()
+    ):
+        normalized_type = "EntireTenant"
+        principal_id = principal_id or "EntireTenant"
+    elif principal_type == "App":
+        normalized_type = "ServicePrincipal"
+    else:
+        normalized_type = principal_type
+
+    if not normalized_type or not principal_id:
+        return None
+
+    return {
+        "workspaceId": workspace["id"],
+        "workspaceName": workspace.get("name"),
+        "workspaceType": workspace.get("type"),
+        "workspaceState": workspace.get("state"),
+        "capacityId": workspace.get("capacityId"),
+        "capacityRegion": None,
+        "role": workspace_role,
+        "principal": {
+            "id": principal_id,
+            "displayName": principal.get("displayName")
+            or principal.get("emailAddress")
+            or principal.get("identifier"),
+            "type": normalized_type,
+            "userDetails": {
+                "userPrincipalName": principal.get("emailAddress")
+                or principal.get("identifier")
+            },
+        },
+    }
+
+
+def normalize_workspace(
+    workspace: dict[str, Any],
+    *,
+    accessible_only: bool,
+) -> dict[str, Any]:
+    return {
+        "workspaceId": workspace.get("id"),
+        "workspaceName": (
+            workspace.get("displayName") if accessible_only else workspace.get("name")
+        ),
+        "workspaceType": workspace.get("type"),
+        "workspaceState": None if accessible_only else workspace.get("state"),
+        "capacityId": workspace.get("capacityId"),
+        "isOnDedicatedCapacity": workspace.get("isOnDedicatedCapacity"),
+        "description": workspace.get("description"),
+    }
+
+
 def normalize_user(user: dict[str, Any]) -> dict[str, Any]:
     normalized = {field: user.get(field) for field in USER_FIELDS}
     normalized["graphLookupError"] = user.get("graphLookupError")
@@ -328,11 +463,18 @@ def main() -> int:
     fabric_tokens = AzureCliTokenProvider(
         resource="https://api.fabric.microsoft.com"
     )
+    power_bi_tokens = AzureCliTokenProvider(
+        resource="https://analysis.windows.net/powerbi/api"
+    )
     graph_tokens = AzureCliTokenProvider(resource_type="ms-graph")
 
-    fabric_token = fabric_tokens.get_token()
+    workspace_tokens = fabric_tokens if args.accessible_only else power_bi_tokens
+    workspace_token = workspace_tokens.get_token()
     graph_token = graph_tokens.get_token()
-    describe_token("Fabric", fabric_token)
+    describe_token(
+        "Fabric user-scoped" if args.accessible_only else "Power BI tenant admin",
+        workspace_token,
+    )
     describe_token("Microsoft Graph", graph_token)
 
     signed_in_graph_user = request_json(
@@ -348,49 +490,80 @@ def main() -> int:
         f"({signed_in_graph_user.get('userPrincipalName')})"
     )
 
-    workspaces = get_all_pages(
-        f"{FABRIC_API_ROOT}/workspaces",
-        fabric_tokens,
-        request_timeout=args.request_timeout,
-        max_retries=args.max_retries,
-    )
-    print(f"Accessible Fabric workspaces: {len(workspaces)}")
-
     role_assignments: list[dict[str, Any]] = []
     inspection_errors: list[dict[str, Any]] = []
-    for index, workspace in enumerate(workspaces, start=1):
-        workspace_id = workspace["id"]
-        workspace_name = workspace.get("displayName")
-        print(f"[{index}/{len(workspaces)}] Reading {workspace_name}")
-        try:
-            assignments = get_all_pages(
-                f"{FABRIC_API_ROOT}/workspaces/{workspace_id}/roleAssignments",
-                fabric_tokens,
-                request_timeout=args.request_timeout,
-                max_retries=args.max_retries,
-            )
-            for assignment in assignments:
-                role_assignments.append(
+
+    if args.accessible_only:
+        workspaces = get_all_pages(
+            f"{FABRIC_API_ROOT}/workspaces",
+            fabric_tokens,
+            request_timeout=args.request_timeout,
+            max_retries=args.max_retries,
+        )
+        print(f"Accessible Fabric workspaces: {len(workspaces)}")
+
+        for index, workspace in enumerate(workspaces, start=1):
+            workspace_id = workspace["id"]
+            workspace_name = workspace.get("displayName")
+            print(f"[{index}/{len(workspaces)}] Reading {workspace_name}")
+            try:
+                assignments = get_all_pages(
+                    f"{FABRIC_API_ROOT}/workspaces/{workspace_id}/roleAssignments",
+                    fabric_tokens,
+                    request_timeout=args.request_timeout,
+                    max_retries=args.max_retries,
+                )
+                for assignment in assignments:
+                    role_assignments.append(
+                        {
+                            "workspaceId": workspace_id,
+                            "workspaceName": workspace_name,
+                            "workspaceType": workspace.get("type"),
+                            "workspaceState": None,
+                            "capacityId": workspace.get("capacityId"),
+                            "capacityRegion": workspace.get("capacityRegion"),
+                            "role": assignment.get("role"),
+                            "principal": assignment.get("principal", {}),
+                        }
+                    )
+            except ApiError as error:
+                inspection_errors.append(
                     {
                         "workspaceId": workspace_id,
                         "workspaceName": workspace_name,
                         "workspaceType": workspace.get("type"),
-                        "capacityId": workspace.get("capacityId"),
-                        "capacityRegion": workspace.get("capacityRegion"),
-                        "role": assignment.get("role"),
-                        "principal": assignment.get("principal", {}),
+                        "statusCode": error.status_code,
+                        "error": error.response_text[:4000],
                     }
                 )
-        except ApiError as error:
-            inspection_errors.append(
-                {
-                    "workspaceId": workspace_id,
-                    "workspaceName": workspace_name,
-                    "workspaceType": workspace.get("type"),
-                    "statusCode": error.status_code,
-                    "error": error.response_text[:4000],
-                }
+    else:
+        try:
+            workspaces = get_tenant_workspaces_with_users(
+                power_bi_tokens,
+                include_inactive=args.include_inactive_workspaces,
+                page_size=args.admin_page_size,
+                request_timeout=args.request_timeout,
+                max_retries=args.max_retries,
             )
+        except ApiError as error:
+            if error.status_code in (401, 403):
+                raise RuntimeError(
+                    "Tenant-wide inventory requires the signed-in user to be a "
+                    "Fabric administrator authorized to use tenant admin APIs. "
+                    "Use --accessible-only to run the user-scoped mode."
+                ) from error
+            raise
+
+        print(f"Tenant Fabric workspaces: {len(workspaces)}")
+        for workspace in workspaces:
+            for principal in workspace.get("users", []):
+                assignment = normalize_admin_workspace_assignment(
+                    workspace,
+                    principal,
+                    account.get("tenantId"),
+                )
+                if assignment:
+                    role_assignments.append(assignment)
 
     user_select = ",".join(USER_FIELDS)
     user_cache: dict[str, dict[str, Any]] = {}
@@ -464,6 +637,7 @@ def main() -> int:
                     "workspaceId": assignment["workspaceId"],
                     "workspaceName": assignment["workspaceName"],
                     "workspaceType": assignment["workspaceType"],
+                    "workspaceState": assignment["workspaceState"],
                     "capacityId": assignment["capacityId"],
                     "capacityRegion": assignment["capacityRegion"],
                     "role": assignment["role"],
@@ -475,15 +649,17 @@ def main() -> int:
                 }
             )
 
-    distinct_user_ids = sorted(
+    distinct_user_references = sorted(
         {row["userId"] for row in effective_access if row.get("userId")}
     )
-    missing_user_ids = [
-        user_id for user_id in distinct_user_ids if user_id not in user_cache
+    missing_user_references = [
+        user_reference
+        for user_reference in distinct_user_references
+        if user_reference not in user_cache
     ]
 
-    for start in range(0, len(missing_user_ids), 20):
-        batch_ids = missing_user_ids[start : start + 20]
+    for start in range(0, len(missing_user_references), 20):
+        batch_ids = missing_user_references[start : start + 20]
         batch_requests = [
             {
                 "id": str(index),
@@ -516,38 +692,44 @@ def main() -> int:
                     }
                 )
 
-    user_locations = [
-        user_cache.get(
-            user_id,
-            normalize_user(
-                {
-                    "id": user_id,
-                    "graphLookupError": "No Microsoft Graph result returned",
-                }
-            ),
-        )
-        for user_id in distinct_user_ids
-    ]
-
+    canonical_users: dict[str, dict[str, Any]] = {}
     for access in effective_access:
-        user = user_cache.get(access["userId"], {})
+        user_reference = access["userId"]
+        user = user_cache.get(user_reference, {})
+        canonical_user_id = user.get("id") or user_reference
+        access["userId"] = canonical_user_id
         for field in ["displayName", "userPrincipalName", "mail", "userType"]:
             access[field] = user.get(field)
+        canonical_users[canonical_user_id] = user or normalize_user(
+            {
+                "id": canonical_user_id,
+                "graphLookupError": "No Microsoft Graph result returned",
+            }
+        )
+
+    user_locations = list(canonical_users.values())
+    workspace_rows = [
+        normalize_workspace(workspace, accessible_only=args.accessible_only)
+        for workspace in workspaces
+    ]
 
     output_dir = Path.cwd()
     output_paths = [
+        output_dir / "workspaces.csv",
         output_dir / "workspace_user_access.csv",
         output_dir / "workspace_user_locations.csv",
         output_dir / "workspace_inspection_errors.csv",
     ]
-    write_csv(output_paths[0], effective_access, ACCESS_FIELDS)
+    write_csv(output_paths[0], workspace_rows, WORKSPACE_FIELDS)
+    write_csv(output_paths[1], effective_access, ACCESS_FIELDS)
     write_csv(
-        output_paths[1],
+        output_paths[2],
         user_locations,
         USER_FIELDS + ["graphLookupError"],
     )
-    write_csv(output_paths[2], inspection_errors, ERROR_FIELDS)
+    write_csv(output_paths[3], inspection_errors, ERROR_FIELDS)
 
+    print(f"Workspace rows: {len(workspace_rows)}")
     print(f"Workspace-user access rows: {len(effective_access)}")
     print(f"Distinct users: {len(user_locations)}")
     print(f"Uninspectable workspaces: {len(inspection_errors)}")

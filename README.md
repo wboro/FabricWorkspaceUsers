@@ -1,7 +1,7 @@
 # Fabric Workspace Users and Locations
 
-`fabric_workspace_users_locations.py` inventories users with access to Microsoft
-Fabric workspaces available to the signed-in user and enriches those users with
+`fabric_workspace_users_locations.py` inventories users with access to all
+Microsoft Fabric workspaces in the tenant and enriches those users with
 location information from Microsoft Entra ID through Microsoft Graph.
 
 The script uses an interactive Azure CLI user session. It does not require a
@@ -11,7 +11,7 @@ custom app registration, client ID, client secret, or service principal.
 
 - Python 3.10 or later.
 - [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli).
-- A Microsoft Entra user account with access to Microsoft Fabric.
+- A Microsoft Entra user assigned the Fabric administrator role.
 - Permission to read the required Microsoft Graph user and group information.
 
 ## Installation
@@ -54,6 +54,23 @@ Run the script from the folder where the CSV files should be created:
 python .\fabric_workspace_users_locations.py
 ```
 
+Tenant-wide mode is the default. It uses the stable Power BI Admin API to list
+all active tenant workspaces and expand their direct users and groups.
+
+For a non-admin user, run the previous user-scoped behavior:
+
+```powershell
+python .\fabric_workspace_users_locations.py --accessible-only
+```
+
+This fallback returns only workspaces visible to the signed-in user.
+
+To include deleted and removing workspaces in tenant-wide mode:
+
+```powershell
+python .\fabric_workspace_users_locations.py --include-inactive-workspaces
+```
+
 To select a tenant when the script needs to start an Azure CLI login:
 
 ```powershell
@@ -76,6 +93,13 @@ python .\fabric_workspace_users_locations.py --help
 ## Output files
 
 The script creates the following files in the current working directory:
+
+### `workspaces.csv`
+
+Contains one row for every workspace returned by the selected mode. In the
+default tenant-wide mode, this includes active workspaces whether or not they
+have any assigned users. Use `--include-inactive-workspaces` to also include
+deleted and removing workspaces.
 
 ### `workspace_user_access.csv`
 
@@ -116,16 +140,26 @@ failures.
 
 ### `workspace_inspection_errors.csv`
 
-Contains workspaces visible to the signed-in user whose role assignments could
-not be inspected. This prevents inaccessible workspaces from being silently
-omitted.
+In `--accessible-only` mode, contains visible workspaces whose role assignments
+could not be inspected. It is normally empty in tenant-wide admin mode.
 
 ## Permission considerations
 
-Listing accessible workspaces uses the Fabric REST API. Listing a workspace's
-role assignments requires the signed-in user to be a Fabric workspace
-**Member** or **Admin**. Workspaces where the user has only Contributor or
-Viewer access can appear in `workspace_inspection_errors.csv`.
+Tenant-wide mode uses the Power BI Admin API and requires:
+
+- The signed-in user to have the **Fabric administrator** tenant role.
+- Authorization to call tenant admin APIs. Microsoft documents
+  `Tenant.Read.All` or `Tenant.ReadWrite.All` for standard delegated
+  applications. The Microsoft Azure CLI first-party token can instead expose
+  its preconsented `user_impersonation` scope, as determined by the tenant.
+
+The API returns direct workspace principals for every tenant workspace.
+Microsoft Graph is then used to expand groups into effective users.
+
+In `--accessible-only` mode, listing a workspace's role assignments requires
+the signed-in user to be a workspace **Member** or **Admin**. Workspaces where
+the user has only Contributor or Viewer access can appear in
+`workspace_inspection_errors.csv`.
 
 Microsoft Graph must allow the Azure CLI enterprise application and signed-in
 user to read tenant users and transitive group membership. The required access
@@ -174,8 +208,10 @@ permissions or roles assigned to your user.
 
 ### Fabric role assignments return HTTP 403
 
-The signed-in user can see the workspace but isn't a Member or Admin. The
-workspace is recorded in `workspace_inspection_errors.csv`.
+In tenant-wide mode, confirm the user has the Fabric administrator role and
+is authorized to use tenant admin APIs. In `--accessible-only` mode, the user
+can see the workspace but isn't a Member or Admin, so the workspace is recorded
+in `workspace_inspection_errors.csv`.
 
 ### A location column is empty
 
