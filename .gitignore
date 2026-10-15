@@ -1,0 +1,31 @@
+# Python environments and generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# Local configuration and editor state
+.env
+.env.*
+!.env.example
+config.local.py
+.vscode/
+.idea/
+
+# Temporary files and operating system metadata
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+~$*
+.DS_Store
+Thumbs.db

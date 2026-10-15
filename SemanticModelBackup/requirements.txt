@@ -1,0 +1,4 @@
+azure-identity>=1.17,<2
+azure-storage-blob>=12.23,<13
+requests>=2.32,<3
+semantic-link-sempy>=0.14.2,<0.15
