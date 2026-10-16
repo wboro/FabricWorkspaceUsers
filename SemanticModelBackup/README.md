@@ -1,5 +1,11 @@
 # Fabric semantic model backup and restore
 
+If workspace-linked ADLS/native backup is not allowed, see the separate
+**`SemanticModelBackupDownload`** directory for a Fabric notebook that downloads
+eligible models as data-inclusive PBIX files and uploads them to private ADLS Gen2.
+PBIX export has coverage restrictions; that alternative is not a native-backup
+replacement for every model type.
+
 Import **`SemanticModelBackup.ipynb`** into Microsoft Fabric as a **PySpark notebook**.
 It is self-contained; no Lakehouse attachment or additional source-file upload is required.
 Edit the configuration cell and run the notebook.
